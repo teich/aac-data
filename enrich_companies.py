@@ -13,6 +13,8 @@ from rich.status import Status
 from rich.logging import RichHandler
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 from dotenv import load_dotenv
+import json
+from decimal import Decimal
 
 # Load environment variables
 load_dotenv()
@@ -26,6 +28,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+class DecimalEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, Decimal):
+            return float(obj)
+        return super().default(obj)
+
 class CompanyEnricher:
     def __init__(self):
         self.conn = self.get_db_connection()
@@ -34,15 +42,8 @@ class CompanyEnricher:
             raise ValueError("COMPANIES_API_TOKEN environment variable is required")
         
         self.api_base_url = "https://api.thecompaniesapi.com/v2"
-        self.excluded_domains = {'hotmail.com', 'gmail.com', 'comcast.net'}
+        self.excluded_domains = {'msn.com','hotmail.com', 'gmail.com', 'comcast.net', 'yahoo.com'}
         self.stats = {'processed': 0, 'success': 0, 'failed': 0}
-        self.progress = Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            console=console
-        )
 
     @staticmethod
     def get_db_connection():
@@ -69,7 +70,7 @@ class CompanyEnricher:
                     LEFT JOIN people p ON p.company_id = c.id
                     LEFT JOIN orders o ON o.person_id = p.id
                     WHERE 
-                        c.enrichment_data IS NULL 
+                        (c.enrichment_data IS NULL OR c.enriched_date < NOW() - INTERVAL '1 week')
                         AND c.domain IS NOT NULL 
                         AND c.domain != ''
                         AND c.domain NOT IN %(excluded_domains)s
@@ -86,12 +87,13 @@ class CompanyEnricher:
             
             result = cur.fetchone()
             if result:
-                return {
+                company = {
                     'id': result[0],
                     'name': result[1],
                     'domain': result[2],
-                    'total_sales': result[3]
+                    'total_sales': float(result[3]) if result[3] else 0.0
                 }
+                return company
             return None
 
     def enrich_company(self, company: Dict[str, Any]) -> bool:
@@ -107,7 +109,36 @@ class CompanyEnricher:
                     f"{self.api_base_url}/companies/{company['domain']}",
                     headers=headers
                 )
-                response.raise_for_status()
+                
+                # Handle 404s specially
+                if response.status_code == 404:
+                    with self.conn.cursor() as cur:
+                        cur.execute("""
+                            UPDATE companies
+                            SET 
+                                enrichment_data = %(enrichment_data)s::jsonb,
+                                enrichment_source = 'thecompaniesapi.com',
+                                enriched_date = NOW(),
+                                updated_at = NOW()
+                            WHERE id = %(company_id)s
+                        """, {
+                            'enrichment_data': json.dumps({
+                                'error': 'not_found',
+                                'status_code': 404,
+                                'message': response.text
+                            }),
+                            'company_id': company['id']
+                        })
+                        self.conn.commit()
+                    
+                    console.print(f"[yellow]⚠[/yellow] Not found: {company['domain']}")
+                    self.stats['failed'] += 1
+                    return True  # Return True because we handled it properly
+                
+                # For other non-200 status codes, raise the error
+                if response.status_code != 200:
+                    console.print(f"[red]API Error ({response.status_code}):[/red] {response.text}")
+                    response.raise_for_status()
                 
                 data = response.json()
                 
@@ -117,14 +148,14 @@ class CompanyEnricher:
                         UPDATE companies
                         SET 
                             name = COALESCE(%(name)s, name),
-                            enrichment_data = %(enrichment_data)s,
+                            enrichment_data = %(enrichment_data)s::jsonb,
                             enrichment_source = 'thecompaniesapi.com',
                             enriched_date = NOW(),
                             updated_at = NOW()
                         WHERE id = %(company_id)s
                     """, {
                         'name': data.get('name'),
-                        'enrichment_data': response.json(),
+                        'enrichment_data': json.dumps(data),
                         'company_id': company['id']
                     })
                     self.conn.commit()
