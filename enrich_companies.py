@@ -49,9 +49,6 @@ class CompanyEnricher(BaseDBHandler):
                         AND c.domain IS NOT NULL 
                         AND c.domain != ''
                         AND c.domain NOT IN %(excluded_domains)s
-                        AND c.domain NOT LIKE '%%hotmail.%%'
-                        AND c.domain NOT LIKE '%%gmail.%%'
-                        AND c.domain NOT LIKE '%%comcast.%%'
                     GROUP BY c.id, c.name, c.domain
                 )
                 SELECT id, name, domain, total_sales
