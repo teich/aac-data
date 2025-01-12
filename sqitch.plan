@@ -6,3 +6,4 @@ products 2025-01-12T03:58:08Z System Administrator <root@oren-mbp.local> # Creat
 people [companies] 2025-01-12T03:58:27Z System Administrator <root@oren-mbp.local> # Create people table
 orders [people] 2025-01-12T03:58:42Z System Administrator <root@oren-mbp.local> # Create orders table
 line_items [orders products] 2025-01-12T03:58:56Z System Administrator <root@oren-mbp.local> # Create line items table
+orders_invoice [orders] 2025-01-12T06:11:41Z System Administrator <root@oren-mbp.local> # Add invoice_number to orders table

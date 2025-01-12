@@ -23,3 +23,7 @@ Thumbs.db
 
 # Input data
 inputs/
+
+# Python files
+*.pyc
+__pycache__/

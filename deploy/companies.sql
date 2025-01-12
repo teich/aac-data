@@ -5,7 +5,7 @@ BEGIN;
 CREATE TABLE companies (
     id SERIAL PRIMARY KEY,
     name TEXT NOT NULL,
-    domain TEXT,
+    domain TEXT UNIQUE,
     estimated_revenue_lower NUMERIC,
     estimated_revenue_upper NUMERIC,
     linkedin_url TEXT,
