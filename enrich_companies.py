@@ -1,32 +1,18 @@
 #!/usr/bin/env python3
 import os
-import psycopg2
 import requests
 from datetime import datetime
 import time
-from typing import Optional, Dict, Any
-import logging
+import json
+from decimal import Decimal
+from base_db import BaseDBHandler, console
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.status import Status
 from rich.logging import RichHandler
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
-from dotenv import load_dotenv
-import json
-from decimal import Decimal
-
-# Load environment variables
-load_dotenv()
-
-# Set up rich console and logging
-console = Console()
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(message)s",
-    handlers=[RichHandler(rich_tracebacks=True)]
-)
-logger = logging.getLogger(__name__)
+from typing import Optional, Dict, Any
 
 class DecimalEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -34,9 +20,9 @@ class DecimalEncoder(json.JSONEncoder):
             return float(obj)
         return super().default(obj)
 
-class CompanyEnricher:
+class CompanyEnricher(BaseDBHandler):
     def __init__(self):
-        self.conn = self.get_db_connection()
+        super().__init__()
         self.api_token = os.getenv('COMPANIES_API_TOKEN')
         if not self.api_token:
             raise ValueError("COMPANIES_API_TOKEN environment variable is required")
@@ -44,17 +30,6 @@ class CompanyEnricher:
         self.api_base_url = "https://api.thecompaniesapi.com/v2"
         self.excluded_domains = {'msn.com','hotmail.com', 'gmail.com', 'comcast.net', 'yahoo.com'}
         self.stats = {'processed': 0, 'success': 0, 'failed': 0}
-
-    @staticmethod
-    def get_db_connection():
-        """Get database connection using environment variables."""
-        return psycopg2.connect(
-            dbname=os.getenv('POSTGRES_DB'),
-            user=os.getenv('POSTGRES_USER'),
-            password=os.getenv('POSTGRES_PASSWORD'),
-            host=os.getenv('POSTGRES_HOST'),
-            port=os.getenv('POSTGRES_PORT', '5432')
-        )
 
     def get_next_company(self) -> Optional[Dict[str, Any]]:
         """Get the next company to enrich, ordered by total sales."""
@@ -216,12 +191,11 @@ class CompanyEnricher:
             
         finally:
             self.display_stats()
-            self.conn.close()
 
 if __name__ == "__main__":
     try:
-        enricher = CompanyEnricher()
-        enricher.run()
+        with CompanyEnricher() as enricher:
+            enricher.run()
     except KeyboardInterrupt:
         console.print("\n[yellow]Process interrupted by user[/yellow]")
         enricher.display_stats()

@@ -1,50 +1,13 @@
 import pandas as pd
-import psycopg2
 from psycopg2.extras import execute_values
 import sys
 from typing import Dict, Tuple, List
-from dotenv import load_dotenv
 import os
 from time import time
 import argparse
-from abc import ABC, abstractmethod
-from tqdm import tqdm
-from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
-from rich.panel import Panel
-from rich.traceback import install
+from base_db import BaseDBHandler, console
 
-# Install rich traceback handler
-install(show_locals=True)
-
-# Initialize rich console
-console = Console()
-
-# Load environment variables from .env file
-load_dotenv()
-
-class BaseImporter(ABC):
-    def __init__(self):
-        self.conn = self.get_db_connection()
-        self.start_time = None
-        self.progress = Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            console=console
-        )
-
-    @staticmethod
-    def get_db_connection():
-        return psycopg2.connect(
-            dbname=os.getenv('POSTGRES_DB'),
-            user=os.getenv('POSTGRES_USER'),
-            password=os.getenv('POSTGRES_PASSWORD'),
-            host=os.getenv('POSTGRES_HOST'),
-            port=os.getenv('POSTGRES_PORT', '5432')
-        )
-
+class BaseImporter(BaseDBHandler):
     def read_csv(self, csv_path: str) -> pd.DataFrame:
         """Read and return the CSV file as a DataFrame."""
         with console.status("[bold green]Reading CSV file..."):
@@ -61,21 +24,6 @@ class BaseImporter(ABC):
             
             console.print(f"[green]✓[/green] Loaded {len(df):,} records")
             return df
-
-    @abstractmethod
-    def process(self, csv_path: str):
-        """Process the import for a specific model."""
-        pass
-
-    def run(self, csv_path: str):
-        """Main entry point for running an import."""
-        self.start_time = time()
-        try:
-            self.process(csv_path)
-        finally:
-            self.conn.close()
-            end_time = time()
-            console.print(Panel(f"[bold green]Import completed in {end_time - self.start_time:.1f} seconds[/bold green]"))
 
 class PeopleImporter(BaseImporter):
     def ensure_unknown_company(self) -> int:
@@ -132,7 +80,7 @@ class PeopleImporter(BaseImporter):
             
             return dict(cur.fetchall())
 
-    def process(self, csv_path: str):
+    def run(self, csv_path: str):
         """Process people import."""
         df = self.read_csv(csv_path)
         
@@ -691,8 +639,8 @@ def main():
         sys.exit(1)
     
     try:
-        importer = importer_class()
-        importer.run(args.csv_file)
+        with importer_class() as importer:
+            importer.run(args.csv_file)
     except FileNotFoundError:
         console.print(f"[bold red]Error:[/bold red] Could not find file: {args.csv_file}")
         sys.exit(1)
