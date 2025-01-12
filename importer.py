@@ -617,52 +617,50 @@ class CombinedOrderImporter(BaseImporter):
                     INSERT INTO orders (person_id, date, amount, invoice_number)
                     VALUES %s
                     ON CONFLICT (invoice_number) DO NOTHING
-                    RETURNING id
+                    RETURNING id, invoice_number
                 """, order_batch, page_size=50)
                 
                 # Get the order IDs that were just inserted
-                order_ids = [id for (id,) in cur.fetchall()]
+                new_orders = dict(cur.fetchall())
                 
-                if len(order_ids) != len(order_batch):
-                    # Some orders were skipped due to existing invoice numbers
-                    # Get the IDs of orders that were skipped
-                    invoice_numbers = [invoice for _, _, _, invoice in order_batch]
-                    placeholders = ','.join(['%s'] * len(invoice_numbers))
-                    cur.execute(f"""
-                        SELECT id, invoice_number FROM orders 
-                        WHERE invoice_number IN ({placeholders})
-                        ORDER BY invoice_number
-                    """, invoice_numbers)
-                    existing_orders = dict(cur.fetchall())
+                # Get all order IDs (both new and existing) by invoice numbers
+                invoice_numbers = [invoice for _, _, _, invoice in order_batch]
+                placeholders = ','.join(['%s'] * len(invoice_numbers))
+                cur.execute(f"""
+                    SELECT id, invoice_number FROM orders 
+                    WHERE invoice_number IN ({placeholders})
+                """, invoice_numbers)
+                # Create a reverse mapping from invoice_number to id
+                all_orders = {invoice: id for id, invoice in cur.fetchall()}
+                
+                # Create a mapping of batch index to order ID
+                order_id_map = {}
+                for i, (_, _, _, invoice) in enumerate(order_batch):
+                    if invoice in all_orders:
+                        order_id_map[i] = all_orders[invoice]
+                
+                # Process line items for all orders (both new and existing)
+                if line_items_batch:
+                    line_items = []
+                    for item in line_items_batch:
+                        order_index = item['order_index']
+                        order_id = order_id_map.get(order_index)
+                        if not order_id:
+                            continue
+                            
+                        line_items.append((
+                            order_id,
+                            item['product_id'],
+                            item['unit_price'],
+                            item['quantity'],
+                            item['amount']
+                        ))
                     
-                    # Create a mapping of batch index to order ID
-                    order_id_map = {}
-                    for i, (_, _, _, invoice) in enumerate(order_batch):
-                        if invoice in existing_orders:
-                            order_id_map[i] = existing_orders[invoice]
-                    
-                    # Update order IDs for line items
-                    if line_items_batch:
-                        line_items = []
-                        for item in line_items_batch:
-                            order_index = item['order_index']
-                            order_id = order_id_map.get(order_index)
-                            if not order_id:
-                                continue
-                                
-                            line_items.append((
-                                order_id,
-                                item['product_id'],
-                                item['unit_price'],
-                                item['quantity'],
-                                item['amount']
-                            ))
-                        
-                        if line_items:
-                            execute_values(cur, """
-                                INSERT INTO line_items (order_id, product_id, unit_price, quantity, amount)
-                                VALUES %s
-                            """, line_items, page_size=100)
+                    if line_items:
+                        execute_values(cur, """
+                            INSERT INTO line_items (order_id, product_id, unit_price, quantity, amount)
+                            VALUES %s
+                        """, line_items, page_size=100)
                 
                 self.conn.commit()
             except Exception as e:
