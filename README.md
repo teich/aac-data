@@ -44,3 +44,11 @@ Line items have a product and a quantity
 - Name [String]
 - Description [String]
 - SKU [String]
+
+## Setup
+
+Run Postgres on LXC.
+Lock down to Tailscale by editing the `pg_hba.conf` file.
+```
+host    all             all             100.64.0.0/10           scram-sha-256
+```
