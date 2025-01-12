@@ -1,0 +1,8 @@
+%syntax-version=1.0.0
+%project=aac-importer
+
+companies 2025-01-12T03:53:03Z System Administrator <root@oren-mbp.local> # Create companies table
+products 2025-01-12T03:58:08Z System Administrator <root@oren-mbp.local> # Create products table
+people [companies] 2025-01-12T03:58:27Z System Administrator <root@oren-mbp.local> # Create people table
+orders [people] 2025-01-12T03:58:42Z System Administrator <root@oren-mbp.local> # Create orders table
+line_items [orders products] 2025-01-12T03:58:56Z System Administrator <root@oren-mbp.local> # Create line items table
