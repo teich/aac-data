@@ -39,7 +39,13 @@ class QBSalesRecord:
     @property
     def channel(self) -> str:
         """Determine sales channel from order number format."""
-        if re.match(r'\d{3}-\d{7}', self.order_number):
+        if not self.order_number:
+            raise ValueError("Order number is required")
+            
+        # Debug log to see what we're trying to match (only in dry run)
+        if hasattr(self, 'dry_run') and self.dry_run:
+            logger.info(f"Checking order number format: '{self.order_number}'")
+        if re.match(r'^\d{3}-\d{7}$', self.order_number.strip()):
             return 'amazon'
         elif re.match(r'3D-\d{4}', self.order_number):
             return 'online_store'
@@ -118,8 +124,8 @@ class QBSalesParser(BaseDBHandler):
         # By default disable progress bar and verbose logging
         # Only enable for dry runs
         self.progress.disable = not dry_run
-        if not dry_run:
-            logger.disabled = True
+        # Always enable logging for debugging
+        logger.disabled = False
         self.simulated_ids = {
             'company': 1,
             'person': 1,
@@ -132,28 +138,35 @@ class QBSalesParser(BaseDBHandler):
     def parse_row(self, row: Dict[str, str], row_num: int) -> Optional[QBSalesRecord]:
         """Parse a single CSV row into a QBSalesRecord."""
         try:
-            # Convert numeric fields
-            quantity = int(float(row['Qty']))
-            price = float(row['Sales Price'])
-            amount = float(row['Amount'])
+            # Convert numeric fields, handling empty strings
+            qty = row['Qty'].strip()
+            sales_price = row['Sales Price'].strip()
+            amount = row['Amount'].strip()
             
-            return QBSalesRecord(
-                type=row['Type'],
-                date=row['Date'],
-                order_number=row['Num'],
-                source_name=row['Source Name'],
-                address_raw=row['Name Address'],
-                contact_name=row['Name Contact'],
-                phone=row['Name Phone #'],
-                email=row['Name E-Mail'],
-                memo=row['Memo'],
-                name=row['Name'],
-                item=row['Item'],
-                item_description=row['Item Description'],
+            quantity = int(float(qty)) if qty else 0
+            price = float(sales_price) if sales_price else 0.0
+            amount = float(amount) if amount else 0.0
+            
+            record = QBSalesRecord(
+                type=row['Type'].strip(),
+                date=row['Date'].strip(),
+                order_number=row['Num'].strip(),
+                source_name=row['Source Name'].strip(),
+                address_raw=row['Name Address'].strip(),
+                contact_name=row['Name Contact'].strip(),
+                phone=row['Name Phone #'].strip(),
+                email=row['Name E-Mail'].strip(),
+                memo=row['Memo'].strip(),
+                name=row['Name'].strip(),
+                item=row['Item'].strip(),
+                item_description=row['Item Description'].strip(),
                 quantity=quantity,
                 price=price,
                 amount=amount
             )
+            # Add dry_run attribute to record for channel property
+            setattr(record, 'dry_run', self.dry_run)
+            return record
         except (ValueError, KeyError) as e:
             self.errors.append({
                 'row': row_num,
@@ -166,8 +179,8 @@ class QBSalesParser(BaseDBHandler):
         """Validate a parsed record."""
         try:
             # Required validations
-            if not record.email and record.source_name != 'Amazon FBA':
-                raise ValueError("Missing email for non-Amazon FBA order")
+            if not record.email and record.channel != 'amazon':
+                raise ValueError("Missing email for non-Amazon order")
             
             # These will raise ValueError if invalid
             _ = record.channel
@@ -318,8 +331,8 @@ class QBSalesParser(BaseDBHandler):
 
     def handle_person(self, record: QBSalesRecord) -> int:
         """Handle person matching/creation logic."""
-        # Handle Amazon FBA case
-        if record.source_name == 'Amazon FBA' and not record.email:
+        # Handle Amazon case
+        if record.channel == 'amazon' and not record.email:
             self.fba_user_counter += 1
             synthetic_email = f'FBA-user{self.fba_user_counter}@FBA-amazon.com'
             company_id = self.find_or_create_company(synthetic_email)
@@ -333,15 +346,84 @@ class QBSalesParser(BaseDBHandler):
             return self.create_person(record, emails[0], company_id)
         
         # Normal case
-        person_id = self.find_person(record.email, record.phone, record.name)
-        if person_id:
-            return person_id
+        found = self.find_person(record.email, record.phone, record.name)
+        if found:
+            return found[0]  # Return just the ID, not the tuple
             
         company_id = self.find_or_create_company(record.email)
         return self.create_person(record, record.email, company_id)
 
+    def ensure_shipping_product(self) -> int:
+        """Ensure shipping product exists and return its ID."""
+        # First check with existing connection
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT id FROM products WHERE sku = 'shipping'")
+            result = cur.fetchone()
+            
+            if self.dry_run:
+                self.operations_log.append({
+                    'operation': 'product',
+                    'sku': 'shipping',
+                    'name': 'Shipping',
+                    'status': 'found' if result else 'would_create',
+                    'existing_id': result[0] if result else None,
+                    'simulated_id': self.simulated_ids['product'] if not result else None
+                })
+                if result:
+                    return result[0]
+                product_id = self.simulated_ids['product']
+                self.simulated_ids['product'] += 1
+                return product_id
+            
+            if result:
+                return result[0]
+        
+        # If shipping product doesn't exist, create it with a new connection
+        try:
+            # Create a new connection just for shipping product creation
+            # Use the same connection parameters as the main connection
+            conn = psycopg2.connect(
+                dbname=self.conn.info.dbname,
+                user=self.conn.info.user,
+                password=self.conn.info.password,
+                host=self.conn.info.host,
+                port=self.conn.info.port
+            )
+            conn.autocommit = True  # Auto-commit each statement
+            
+            with conn.cursor() as cur:
+                # Double-check if product was created while we were checking
+                cur.execute("SELECT id FROM products WHERE sku = 'shipping'")
+                result = cur.fetchone()
+                if result:
+                    return result[0]
+                
+                # Create shipping product
+                cur.execute(
+                    """
+                    INSERT INTO products (name, description, sku, created_at, updated_at)
+                    VALUES ('Shipping', 'Shipping charges', 'shipping', NOW(), NOW())
+                    RETURNING id
+                    """
+                )
+                result = cur.fetchone()
+                if not result:
+                    raise Exception("Failed to create shipping product - no ID returned")
+                if self.dry_run:
+                    logger.info(f"Created shipping product with ID: {result[0]}")
+                return result[0]
+        except Exception as e:
+            logger.error(f"Failed to ensure shipping product: {str(e)}")
+            raise
+        finally:
+            if 'conn' in locals():
+                conn.close()
+
     def find_or_create_product(self, record: QBSalesRecord) -> int:
         """Find or create product based on SKU."""
+        if record.sku == 'shipping':
+            return self.ensure_shipping_product()
+
         with self.conn.cursor() as cur:
             # Try to find existing product
             cur.execute("SELECT id FROM products WHERE sku = %s", (record.sku,))
@@ -362,23 +444,24 @@ class QBSalesParser(BaseDBHandler):
                 self.simulated_ids['product'] += 1
                 return product_id
 
-            # Try to find existing product
-            cur.execute("SELECT id FROM products WHERE sku = %s", (record.sku,))
-            result = cur.fetchone()
-            
             if result:
                 return result[0]
             
-            # Create new product
-            cur.execute(
-                """
-                INSERT INTO products (name, description, sku)
-                VALUES (%s, %s, %s)
-                RETURNING id
-                """,
-                (record.item, record.item_description, record.sku)
-            )
-            return cur.fetchone()[0]
+            # Create regular product
+            try:
+                description = record.item_description or record.item
+                cur.execute(
+                    """
+                    INSERT INTO products (name, description, sku, created_at, updated_at)
+                    VALUES (%s, %s, %s, NOW(), NOW())
+                    RETURNING id
+                    """,
+                    (record.item, description, record.sku)
+                )
+                return cur.fetchone()[0]
+            except Exception as e:
+                logger.error(f"Failed to create product: {str(e)}")
+                raise
 
     def create_order(self, record: QBSalesRecord, person_id: int, product_id: int) -> Tuple[int, int]:
         """Create order record and line item."""
@@ -443,26 +526,31 @@ class QBSalesParser(BaseDBHandler):
     def process_record(self, record: QBSalesRecord) -> bool:
         """Process a single record, creating all necessary database records."""
         try:
-            with self.conn:
-                # Handle person and company
-                person_id = self.handle_person(record)
-                
-                # Handle product
-                product_id = self.find_or_create_product(record)
-                
-                # Create order and line item
-                order_id, line_item_id = self.create_order(record, person_id, product_id)
-                
-                # Remove per-order logging in non-dry-run mode
-                if self.dry_run:
-                    logger.info(
-                        f"Created order {order_id} with line item {line_item_id} "
-                        f"for person {person_id} and product {product_id}"
-                    )
-                
-                return True
-                
+            # Handle person and company
+            if self.dry_run:
+                logger.info(f"Processing record with order number: {record.order_number}")
+            person_id = self.handle_person(record)
+            if self.dry_run:
+                logger.info(f"Created/found person with ID: {person_id}")
+            
+            # Handle product
+            product_id = self.find_or_create_product(record)
+            if self.dry_run:
+                logger.info(f"Created/found product with ID: {product_id}")
+            
+            # Create order and line item
+            order_id, line_item_id = self.create_order(record, person_id, product_id)
+            if self.dry_run:
+                logger.info(f"Created order {order_id} with line item {line_item_id}")
+                logger.info(
+                    f"Created order {order_id} with line item {line_item_id} "
+                    f"for person {person_id} and product {product_id}"
+                )
+            
+            return True
+            
         except Exception as e:
+            logger.error(f"Failed to process record: {str(e)}")
             self.errors.append({
                 'error': f"Failed to process record: {str(e)}",
                 'record': record
@@ -501,7 +589,8 @@ class QBSalesParser(BaseDBHandler):
                         processed_count += 1
                         
                         if self.line_limit and processed_count >= self.line_limit:
-                            logger.info(f"Reached line limit of {self.line_limit}")
+                            if self.dry_run:
+                                logger.info(f"Reached line limit of {self.line_limit}")
                             break
                         
                     self.progress.update(task_id, advance=1)
