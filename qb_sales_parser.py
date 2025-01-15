@@ -5,6 +5,10 @@ from typing import List, Optional, Dict, Any
 import re
 from base_db import BaseDBHandler, logger
 from rich.progress import Progress
+from datetime import datetime
+import psycopg2
+from typing import Optional, Tuple
+from email.utils import parseaddr
 
 @dataclass
 class Address:
@@ -103,6 +107,7 @@ class QBSalesParser(BaseDBHandler):
         self.csv_path = csv_path
         self.address_parser = AddressParser()
         self.errors: List[Dict[str, Any]] = []
+        self.fba_user_counter = 0  # Counter for synthetic FBA users
     
     def parse_row(self, row: Dict[str, str], row_num: int) -> Optional[QBSalesRecord]:
         """Parse a single CSV row into a QBSalesRecord."""
@@ -161,6 +166,211 @@ class QBSalesParser(BaseDBHandler):
             })
             return False
     
+    def get_domain_from_email(self, email: str) -> str:
+        """Extract domain from email address."""
+        _, email_part = parseaddr(email)
+        return email_part.split('@')[1] if '@' in email_part else None
+
+    def find_or_create_company(self, email: str) -> int:
+        """Find or create company based on email domain."""
+        if not email:
+            return None
+            
+        domain = self.get_domain_from_email(email)
+        if not domain:
+            return None
+            
+        with self.conn.cursor() as cur:
+            # Try to find existing company
+            cur.execute(
+                "SELECT id FROM companies WHERE domain = %s",
+                (domain,)
+            )
+            result = cur.fetchone()
+            
+            if result:
+                return result[0]
+                
+            # Create new company
+            cur.execute(
+                """
+                INSERT INTO companies (name, domain)
+                VALUES (%s, %s)
+                RETURNING id
+                """,
+                (domain, domain)
+            )
+            return cur.fetchone()[0]
+
+    def find_person(self, email: str, phone: str, name: str) -> Optional[int]:
+        """Find person by email, phone, or exact name match."""
+        with self.conn.cursor() as cur:
+            # Try email match first
+            if email:
+                cur.execute("SELECT id FROM people WHERE email = %s", (email,))
+                result = cur.fetchone()
+                if result:
+                    return result[0]
+            
+            # Try phone match
+            if phone:
+                cur.execute("SELECT id FROM people WHERE phone = %s", (phone,))
+                result = cur.fetchone()
+                if result:
+                    return result[0]
+            
+            # Try exact name match
+            if name:
+                cur.execute("SELECT id FROM people WHERE name = %s", (name,))
+                result = cur.fetchone()
+                if result:
+                    return result[0]
+            
+            return None
+
+    def create_person(self, record: QBSalesRecord, email: str, company_id: int) -> int:
+        """Create a new person record."""
+        address = self.address_parser.parse(record.address_raw)
+        
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO people (
+                    name, email, phone, address, city, state, zip, country,
+                    company_id
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (
+                    record.name,
+                    email,
+                    record.phone,
+                    address.street,
+                    address.city,
+                    address.state,
+                    address.zip_code,
+                    address.country,
+                    company_id
+                )
+            )
+            return cur.fetchone()[0]
+
+    def handle_person(self, record: QBSalesRecord) -> int:
+        """Handle person matching/creation logic."""
+        # Handle Amazon FBA case
+        if record.source_name == 'Amazon FBA' and not record.email:
+            self.fba_user_counter += 1
+            synthetic_email = f'FBA-user{self.fba_user_counter}@FBA-amazon.com'
+            company_id = self.find_or_create_company(synthetic_email)
+            return self.create_person(record, synthetic_email, company_id)
+        
+        # Handle multiple email addresses
+        if ';' in record.email:
+            emails = [e.strip() for e in record.email.split(';')]
+            # Create person for first email
+            company_id = self.find_or_create_company(emails[0])
+            return self.create_person(record, emails[0], company_id)
+        
+        # Normal case
+        person_id = self.find_person(record.email, record.phone, record.name)
+        if person_id:
+            return person_id
+            
+        company_id = self.find_or_create_company(record.email)
+        return self.create_person(record, record.email, company_id)
+
+    def find_or_create_product(self, record: QBSalesRecord) -> int:
+        """Find or create product based on SKU."""
+        with self.conn.cursor() as cur:
+            # Try to find existing product
+            cur.execute("SELECT id FROM products WHERE sku = %s", (record.sku,))
+            result = cur.fetchone()
+            
+            if result:
+                return result[0]
+            
+            # Create new product
+            cur.execute(
+                """
+                INSERT INTO products (name, description, sku)
+                VALUES (%s, %s, %s)
+                RETURNING id
+                """,
+                (record.item, record.item_description, record.sku)
+            )
+            return cur.fetchone()[0]
+
+    def create_order(self, record: QBSalesRecord, person_id: int, product_id: int) -> Tuple[int, int]:
+        """Create order record and line item."""
+        with self.conn.cursor() as cur:
+            # Create order
+            cur.execute(
+                """
+                INSERT INTO orders (
+                    person_id, date, amount, order_number, channel, source
+                )
+                VALUES (%s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (
+                    person_id,
+                    datetime.strptime(record.date, '%m/%d/%Y').date(),
+                    record.amount,
+                    record.order_number,
+                    record.channel,
+                    record.source_name
+                )
+            )
+            order_id = cur.fetchone()[0]
+            
+            # Create line item
+            cur.execute(
+                """
+                INSERT INTO line_items (
+                    order_id, product_id, unit_price, quantity, amount
+                )
+                VALUES (%s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (
+                    order_id,
+                    product_id,
+                    record.price,
+                    record.quantity,
+                    record.amount
+                )
+            )
+            line_item_id = cur.fetchone()[0]
+            
+            return order_id, line_item_id
+
+    def process_record(self, record: QBSalesRecord) -> bool:
+        """Process a single record, creating all necessary database records."""
+        try:
+            with self.conn:
+                # Handle person and company
+                person_id = self.handle_person(record)
+                
+                # Handle product
+                product_id = self.find_or_create_product(record)
+                
+                # Create order and line item
+                order_id, line_item_id = self.create_order(record, person_id, product_id)
+                
+                logger.info(
+                    f"Created order {order_id} with line item {line_item_id} "
+                    f"for person {person_id} and product {product_id}"
+                )
+                
+                return True
+                
+        except Exception as e:
+            self.errors.append({
+                'error': f"Failed to process record: {str(e)}",
+                'record': record
+            })
+            return False
+
     def run(self):
         """Process the QuickBooks sales CSV file."""
         valid_records: List[QBSalesRecord] = []
@@ -198,6 +408,11 @@ class QBSalesParser(BaseDBHandler):
                     for error in self.errors:
                         logger.error(f"Row {error['row']}: {error['error']}")
                 
+            # Process valid records
+            for record in valid_records:
+                if not self.process_record(record):
+                    logger.error(f"Failed to process record: {record}")
+
         return valid_records
 
 if __name__ == '__main__':
