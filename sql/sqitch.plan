@@ -9,3 +9,4 @@ line_items [orders products] 2025-01-12T03:58:56Z System Administrator <root@ore
 orders_invoice [orders] 2025-01-12T06:11:41Z System Administrator <root@oren-mbp.local> # Add invoice_number to orders table
 companies_enrichment [companies] 2025-01-12T07:30:00Z System Administrator <root@oren-mbp.local> # Add enrichment fields to companies table
 companies_cleanup [companies_enrichment] 2025-01-12T08:30:00Z System Administrator <root@oren-mbp.local> # Remove old company fields
+people_enrichment [people] 2025-01-12T09:30:00Z System Administrator <root@oren-mbp.local> # Add enrichment fields to people table

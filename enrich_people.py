@@ -4,6 +4,7 @@ import requests
 from datetime import datetime
 import time
 import json
+import argparse
 from decimal import Decimal
 from base_db import BaseDBHandler, console
 from rich.console import Console
@@ -20,90 +21,101 @@ class DecimalEncoder(json.JSONEncoder):
             return float(obj)
         return super().default(obj)
 
-class CompanyEnricher(BaseDBHandler):
+class PeopleEnricher(BaseDBHandler):
     def __init__(self):
         super().__init__()
-        self.api_token = os.getenv('COMPANIES_API_TOKEN')
+        self.api_token = os.getenv('PEOPLEDATALAB_API_TOKEN')
         if not self.api_token:
-            raise ValueError("COMPANIES_API_TOKEN environment variable is required")
+            raise ValueError("PEOPLEDATALAB_API_TOKEN environment variable is required")
         
-        self.api_base_url = "https://api.thecompaniesapi.com/v2"
-        self.excluded_domains = {'msn.com','hotmail.com', 'gmail.com', 'comcast.net', 'yahoo.com'}
+        self.api_url = "https://api.peopledatalabs.com/v5/person/enrich"
+        self.excluded_domains = {'msn.com', 'hotmail.com', 'gmail.com', 'comcast.net', 'yahoo.com'}
         self.stats = {'processed': 0, 'success': 0, 'failed': 0}
 
-    def get_next_company(self) -> Optional[Dict[str, Any]]:
-        """Get the next company to enrich, ordered by total sales."""
+    def get_next_person(self) -> Optional[Dict[str, Any]]:
+        """Get the next person to enrich, ordered by total orders."""
         with self.conn.cursor() as cur:
             cur.execute("""
-                WITH company_sales AS (
+                WITH person_orders AS (
                     SELECT 
-                        c.id,
-                        c.name,
-                        c.domain,
-                        COALESCE(SUM(o.amount), 0) as total_sales
-                    FROM companies c
-                    LEFT JOIN people p ON p.company_id = c.id
+                        p.id,
+                        p.name,
+                        p.email,
+                        c.domain as company_domain,
+                        COALESCE(SUM(o.amount), 0) as total_orders
+                    FROM people p
+                    JOIN companies c ON c.id = p.company_id
                     LEFT JOIN orders o ON o.person_id = p.id
                     WHERE 
-                        (c.enrichment_data IS NULL OR c.enriched_date < NOW() - INTERVAL '1 week')
-                        AND c.domain IS NOT NULL 
-                        AND c.domain != ''
-                        AND c.domain NOT IN %(excluded_domains)s
-                    GROUP BY c.id, c.name, c.domain
+                        (p.enrichment_data IS NULL OR p.enriched_date < NOW() - INTERVAL '1 week')
+                        AND p.email IS NOT NULL 
+                        AND p.email != ''
+                        AND SPLIT_PART(p.email, '@', 2) NOT IN %(excluded_domains)s
+                    GROUP BY p.id, p.name, p.email, c.domain
                 )
-                SELECT id, name, domain, total_sales
-                FROM company_sales
-                ORDER BY total_sales DESC
+                SELECT id, name, email, company_domain, total_orders
+                FROM person_orders
+                ORDER BY total_orders DESC
                 LIMIT 1
             """, {'excluded_domains': tuple(self.excluded_domains)})
             
             result = cur.fetchone()
             if result:
-                company = {
+                person = {
                     'id': result[0],
                     'name': result[1],
-                    'domain': result[2],
-                    'total_sales': float(result[3]) if result[3] else 0.0
+                    'email': result[2],
+                    'company_domain': result[3],
+                    'total_orders': float(result[4]) if result[4] else 0.0
                 }
-                return company
+                return person
             return None
 
-    def enrich_company(self, company: Dict[str, Any]) -> bool:
-        """Enrich a single company using the API."""
+    def enrich_person(self, person: Dict[str, Any]) -> bool:
+        """Enrich a single person using the PeopleDataLabs API."""
         try:
-            with Status(f"[bold blue]Enriching {company['domain']}...", console=console):
+            with Status(f"[bold blue]Enriching {person['email']}...", console=console):
                 headers = {
-                    'Authorization': f'Basic {self.api_token}',
+                    'X-Api-Key': self.api_token,
                     'Content-Type': 'application/json'
                 }
                 
+                params = {
+                    'email': person['email'],
+                    'pretty': 'false',
+                    'min_likelihood': '2',
+                    'include_if_matched': 'false',
+                    'titlecase': 'false'
+                }
+                
                 response = requests.get(
-                    f"{self.api_base_url}/companies/{company['domain']}",
-                    headers=headers
+                    self.api_url,
+                    headers=headers,
+                    params=params
                 )
                 
                 # Handle 404s specially
                 if response.status_code == 404:
                     with self.conn.cursor() as cur:
                         cur.execute("""
-                            UPDATE companies
+                            UPDATE people
                             SET 
                                 enrichment_data = %(enrichment_data)s::jsonb,
-                                enrichment_source = 'thecompaniesapi.com',
+                                enrichment_source = 'peopledatalabs.com',
                                 enriched_date = NOW(),
                                 updated_at = NOW()
-                            WHERE id = %(company_id)s
+                            WHERE id = %(person_id)s
                         """, {
                             'enrichment_data': json.dumps({
                                 'error': 'not_found',
                                 'status_code': 404,
                                 'message': response.text
                             }),
-                            'company_id': company['id']
+                            'person_id': person['id']
                         })
                         self.conn.commit()
                     
-                    console.print(f"[yellow]⚠[/yellow] Not found: {company['domain']}")
+                    console.print(f"[yellow]⚠[/yellow] Not found: {person['email']}")
                     self.stats['failed'] += 1
                     return True  # Return True because we handled it properly
                 
@@ -114,45 +126,46 @@ class CompanyEnricher(BaseDBHandler):
                 
                 data = response.json()
                 
-                # Update the company record
+                # Update the person record
                 with self.conn.cursor() as cur:
                     cur.execute("""
-                        UPDATE companies
+                        UPDATE people
                         SET 
                             name = COALESCE(%(name)s, name),
                             enrichment_data = %(enrichment_data)s::jsonb,
-                            enrichment_source = 'thecompaniesapi.com',
+                            enrichment_source = 'peopledatalabs.com',
                             enriched_date = NOW(),
                             updated_at = NOW()
-                        WHERE id = %(company_id)s
+                        WHERE id = %(person_id)s
                     """, {
-                        'name': data.get('name'),
+                        'name': data.get('full_name'),
                         'enrichment_data': json.dumps(data),
-                        'company_id': company['id']
+                        'person_id': person['id']
                     })
                     self.conn.commit()
                 
                 self.stats['success'] += 1
-                console.print(f"[green]✓[/green] Enriched: {company['domain']}")
+                console.print(f"[green]✓[/green] Enriched: {person['email']}")
                 return True
                 
         except Exception as e:
             self.stats['failed'] += 1
-            console.print(f"[red]✗[/red] Failed: {company['domain']} - {str(e)}")
+            console.print(f"[red]✗[/red] Failed: {person['email']} - {str(e)}")
             self.conn.rollback()
             return False
 
-    def display_company_info(self, company: Dict[str, Any]):
-        """Display company information in a pretty table."""
+    def display_person_info(self, person: Dict[str, Any]):
+        """Display person information in a pretty table."""
         table = Table(show_header=True, header_style="bold magenta")
         table.add_column("Field", style="cyan")
         table.add_column("Value", style="yellow")
         
-        table.add_row("Name", company['name'])
-        table.add_row("Domain", company['domain'])
-        table.add_row("Total Sales", f"${company['total_sales']:,.2f}")
+        table.add_row("Name", person['name'])
+        table.add_row("Email", person['email'])
+        table.add_row("Company Domain", person['company_domain'])
+        table.add_row("Total Orders", f"${person['total_orders']:,.2f}")
         
-        console.print(Panel(table, title="[bold]Company Details[/bold]", border_style="blue"))
+        console.print(Panel(table, title="[bold]Person Details[/bold]", border_style="blue"))
 
     def display_stats(self):
         """Display enrichment statistics."""
@@ -160,7 +173,7 @@ class CompanyEnricher(BaseDBHandler):
         stats_table.add_column("Metric", style="cyan")
         stats_table.add_column("Count", style="yellow", justify="right")
         
-        stats_table.add_row("Companies Processed", str(self.stats['processed']))
+        stats_table.add_row("People Processed", str(self.stats['processed']))
         stats_table.add_row("Successful Enrichments", str(self.stats['success']))
         stats_table.add_row("Failed Enrichments", str(self.stats['failed']))
         success_rate = (self.stats['success'] / self.stats['processed'] * 100) if self.stats['processed'] > 0 else 0
@@ -168,20 +181,26 @@ class CompanyEnricher(BaseDBHandler):
         
         console.print(Panel(stats_table, title="[bold]Enrichment Statistics[/bold]", border_style="green"))
 
-    def run(self):
+    def run(self, num_records=None):
         """Main enrichment loop."""
-        console.print(Panel.fit("[bold blue]Starting Company Enrichment Process[/bold blue]", border_style="blue"))
+        console.print(Panel.fit("[bold blue]Starting People Enrichment Process[/bold blue]", border_style="blue"))
         
         try:
+            records_processed = 0
             while True:
-                company = self.get_next_company()
-                if not company:
-                    console.print("[yellow]No more companies to enrich[/yellow]")
+                if num_records is not None and records_processed >= num_records:
+                    console.print(f"[yellow]Processed requested number of records ({num_records})[/yellow]")
+                    break
+
+                person = self.get_next_person()
+                if not person:
+                    console.print("[yellow]No more people to enrich[/yellow]")
                     break
                 
                 self.stats['processed'] += 1
-                self.display_company_info(company)
-                success = self.enrich_company(company)
+                records_processed += 1
+                self.display_person_info(person)
+                success = self.enrich_person(person)
                 
                 # Add a small delay between requests to be nice to the API
                 time.sleep(0.1)
@@ -189,13 +208,24 @@ class CompanyEnricher(BaseDBHandler):
         finally:
             self.display_stats()
 
+def parse_args():
+    parser = argparse.ArgumentParser(description='Enrich people records using PeopleDataLabs API')
+    parser.add_argument(
+        '-n', '--num-records',
+        type=int,
+        default=None,
+        help='Number of records to process (default: process all records)'
+    )
+    return parser.parse_args()
+
 if __name__ == "__main__":
+    args = parse_args()
     try:
-        with CompanyEnricher() as enricher:
-            enricher.run()
+        with PeopleEnricher() as enricher:
+            enricher.run(args.num_records)
     except KeyboardInterrupt:
         console.print("\n[yellow]Process interrupted by user[/yellow]")
         enricher.display_stats()
     except Exception as e:
         console.print("[bold red]Unexpected error occurred:[/bold red]")
-        console.print_exception() 
+        console.print_exception()
